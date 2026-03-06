@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#define DATATYPE double
+
 // Boundary value at the LHS of the bar
 #define LEFT_VALUE 1.0
 // Boundary value at the RHS of the bar
@@ -13,7 +15,7 @@
 // How often to report the norm
 #define REPORT_NORM_PERIOD 100
 
-static void initialise(double*, double*, int, int);
+static void initialise(DATATYPE*, DATATYPE*, int, int);
 static uint64_t millis();
 
 int main(int argc, char * argv[]) {
@@ -48,9 +50,9 @@ int main(int argc, char * argv[]) {
     int mem_size_x=nx+2;
     int mem_size_y=ny+2;
 
-    double * u_k = malloc(sizeof(double) * mem_size_x * mem_size_y);
-    double * u_kp1 = malloc(sizeof(double) * mem_size_x * mem_size_y);
-    double * temp;    
+    DATATYPE * u_k = malloc(sizeof(DATATYPE) * mem_size_x * mem_size_y);
+    DATATYPE * u_kp1 = malloc(sizeof(DATATYPE) * mem_size_x * mem_size_y);
+    DATATYPE * temp;    
 
     initialise(u_k, u_kp1, nx, ny);
 
@@ -110,7 +112,7 @@ int main(int argc, char * argv[]) {
  * Initialises the arrays, such that u_k contains the boundary conditions at the start and end points and all other
  * points are zero. u_kp1 is set to equal u_k
  */
-static void initialise(double * u_k, double * u_kp1, int nx, int ny) {
+static void initialise(DATATYPE * u_k, DATATYPE * u_kp1, int nx, int ny) {
     int i,j;
     // We are setting the boundary (left and right) values here, in the parallel version this should be exactly the same and no changed required
     for (i=0;i<nx+1;i++) {
