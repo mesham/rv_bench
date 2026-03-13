@@ -1,0 +1,216 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+#include <time.h>
+#include <riscv_vector.h>
+
+#define DATATYPE double
+
+// Boundary value at the LHS of the bar
+#define LEFT_VALUE  1.0
+// Boundary value at the RHS of the bar
+#define RIGHT_VALUE 10.0
+// The maximum number of iterations
+#define MAX_ITERATIONS 100000
+// How often to report the norm
+#define REPORT_NORM_PERIOD 100
+
+static void initialise(DATATYPE*, DATATYPE*, int, int);
+static uint64_t millis();
+
+/*
+ * Compute sum of squared residuals over the interior domain.
+ *
+ * residual(i,j) = 4*u[i,j] - u[i-1,j] - u[i+1,j] - u[i,j-1] - u[i,j+1]
+ *
+ * The inner loop (i = 1..ny) is contiguous in memory, so we use
+ * unit-stride vle64 loads.  LMUL=4 gives 4x the natural vector length,
+ * improving throughput without exhausting all 32 vector registers.
+ */
+static double compute_rnorm(const DATATYPE *u_k, int nx, int ny, int msz_y) {
+    double rnorm = 0.0;
+
+    for (int j = 1; j <= nx; j++) {
+        const double *center = &u_k[1 +  j      * msz_y];
+        const double *left   = &u_k[0 +  j      * msz_y]; /* i-1 */
+        const double *right  = &u_k[2 +  j      * msz_y]; /* i+1 */
+        const double *up     = &u_k[1 + (j - 1) * msz_y]; /* j-1 */
+        const double *down   = &u_k[1 + (j + 1) * msz_y]; /* j+1 */
+
+        size_t n = (size_t)ny;
+        size_t i = 0;
+        while (i < n) {
+            size_t vl = __riscv_vsetvl_e64m4(n - i);
+
+            vfloat64m4_t vcenter = __riscv_vle64_v_f64m4(center + i, vl);
+            vfloat64m4_t vleft   = __riscv_vle64_v_f64m4(left   + i, vl);
+            vfloat64m4_t vright  = __riscv_vle64_v_f64m4(right  + i, vl);
+            vfloat64m4_t vup     = __riscv_vle64_v_f64m4(up     + i, vl);
+            vfloat64m4_t vdown   = __riscv_vle64_v_f64m4(down   + i, vl);
+
+            /* neighbors = left + right + up + down */
+            vfloat64m4_t neighbors = __riscv_vfadd_vv_f64m4(vleft,     vright, vl);
+            neighbors              = __riscv_vfadd_vv_f64m4(neighbors,  vup,   vl);
+            neighbors              = __riscv_vfadd_vv_f64m4(neighbors,  vdown, vl);
+
+            /* residual = 4*center - neighbors
+             * Use vfmacc: acc = acc + scalar * v
+             *   start with acc = -neighbors, then add 4.0 * center */
+            vfloat64m4_t neg_nb   = __riscv_vfneg_v_f64m4(neighbors, vl);
+            vfloat64m4_t residual = __riscv_vfmacc_vf_f64m4(neg_nb, 4.0, vcenter, vl);
+
+            /* sq = residual^2 */
+            vfloat64m4_t sq = __riscv_vfmul_vv_f64m4(residual, residual, vl);
+
+            /* horizontal reduction into scalar */
+            vfloat64m1_t zero = __riscv_vfmv_s_f_f64m1(0.0, 1);
+            vfloat64m1_t red  = __riscv_vfredusum_vs_f64m4_f64m1(sq, zero, vl);
+            double partial;
+            __riscv_vse64_v_f64m1(&partial, red, 1);
+            rnorm += partial;
+
+            i += vl;
+        }
+    }
+    return rnorm;
+}
+
+/*
+ * Jacobi update: u_kp1[i,j] = 0.25 * (u[i-1,j] + u[i+1,j] + u[i,j-1] + u[i,j+1])
+ *
+ * Only the four neighbours are loaded — center is not read.
+ * LMUL=8 is used here: with VLEN=256 this yields 32 doubles per vector group.
+ * Register pressure is low (4 load vectors peak = 4×8 = 32 physical registers),
+ * so m8 fills the vector register file without spilling.
+ */
+static void jacobi_update(const DATATYPE *u_k, DATATYPE *u_kp1,
+                          int nx, int ny, int msz_y) {
+    for (int j = 1; j <= nx; j++) {
+        const double *left  = &u_k[0 +  j      * msz_y];
+        const double *right = &u_k[2 +  j      * msz_y];
+        const double *up    = &u_k[1 + (j - 1) * msz_y];
+        const double *down  = &u_k[1 + (j + 1) * msz_y];
+        double       *out   = &u_kp1[1 + j * msz_y];
+
+        size_t n = (size_t)ny;
+        size_t i = 0;
+        while (i < n) {
+            size_t vl = __riscv_vsetvl_e64m8(n - i);
+
+            vfloat64m8_t vleft  = __riscv_vle64_v_f64m8(left  + i, vl);
+            vfloat64m8_t vright = __riscv_vle64_v_f64m8(right + i, vl);
+            vfloat64m8_t vup    = __riscv_vle64_v_f64m8(up    + i, vl);
+            vfloat64m8_t vdown  = __riscv_vle64_v_f64m8(down  + i, vl);
+
+            /* sum = left + right + up + down */
+            vfloat64m8_t sum = __riscv_vfadd_vv_f64m8(vleft, vright, vl);
+            sum              = __riscv_vfadd_vv_f64m8(sum,   vup,    vl);
+            sum              = __riscv_vfadd_vv_f64m8(sum,   vdown,  vl);
+
+            /* result = 0.25 * sum */
+            vfloat64m8_t result = __riscv_vfmul_vf_f64m8(sum, 0.25, vl);
+
+            __riscv_vse64_v_f64m8(out + i, result, vl);
+            i += vl;
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int nx, ny, max_its;
+    double convergence_accuracy;
+
+    if (argc != 5) {
+        printf("You should provide four command line arguments, the global size in X, "
+               "the global size in Y, convergence accuracy and max number iterations\n");
+        printf("In the absence of this defaulting to x=128, y=1024, convergence=3e-3, "
+               "no max number of iterations\n");
+        nx = 128;
+        ny = 1024;
+        convergence_accuracy = 3e-3;
+        max_its = 0;
+    } else {
+        nx = atoi(argv[1]);
+        ny = atoi(argv[2]);
+        convergence_accuracy = atof(argv[3]);
+        max_its = atoi(argv[4]);
+    }
+
+#ifdef INSTRUMENTED
+    if (max_its < 1 || max_its > 100) {
+        max_its = 100;
+        printf("Limiting the instrumented run to 100 iterations to keep file size small, "
+               "you can change this in the code if you really want\n");
+    }
+#endif
+
+    printf("Global size in X=%d, Global size in Y=%d\n\n", nx, ny);
+
+    int msz_y = ny + 2;
+    int msz_x = nx + 2;
+
+    DATATYPE *u_k   = malloc(sizeof(DATATYPE) * msz_x * msz_y);
+    DATATYPE *u_kp1 = malloc(sizeof(DATATYPE) * msz_x * msz_y);
+    DATATYPE *temp;
+
+    initialise(u_k, u_kp1, nx, ny);
+
+    double bnorm = sqrt(compute_rnorm(u_k, nx, ny, msz_y));
+    double norm  = 0.0;
+
+    int k;
+    uint64_t start_ms = millis();
+    for (k = 0; k < MAX_ITERATIONS; k++) {
+        double rnorm = compute_rnorm(u_k, nx, ny, msz_y);
+        norm = sqrt(rnorm) / bnorm;
+
+        if (norm < convergence_accuracy) break;
+        if (max_its > 0 && k >= max_its) break;
+
+        jacobi_update(u_k, u_kp1, nx, ny, msz_y);
+
+        temp = u_kp1; u_kp1 = u_k; u_k = temp;
+
+        if (k % REPORT_NORM_PERIOD == 0)
+            printf("Iteration= %d Relative Norm=%e\n", k, norm);
+    }
+    uint64_t end_ms = millis();
+    printf("\nTerminated on %d iterations, Relative Norm=%e, Total time=%llu ms\n",
+           k, norm, (unsigned long long)(end_ms - start_ms));
+
+    free(u_k);
+    free(u_kp1);
+    return 0;
+}
+
+/**
+ * Initialises the arrays, such that u_k contains the boundary conditions at the
+ * start and end points and all other points are zero.  u_kp1 is set to equal u_k.
+ */
+static void initialise(DATATYPE *u_k, DATATYPE *u_kp1, int nx, int ny) {
+    int i, j;
+    for (i = 0; i < nx + 1; i++) {
+        u_k[i * (ny + 2)]           = LEFT_VALUE;
+        u_k[(ny + 1) + i * (ny + 2)] = RIGHT_VALUE;
+    }
+    for (j = 0; j <= nx + 1; j++) {
+        for (i = 1; i <= ny; i++) {
+            u_k[i + j * (ny + 2)] = 0.0;
+        }
+    }
+    for (j = 0; j <= nx + 1; j++) {
+        for (i = 0; i <= ny + 1; i++) {
+            u_kp1[i + j * (ny + 2)] = u_k[i + j * (ny + 2)];
+        }
+    }
+}
+
+static uint64_t millis() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        perror("clock_gettime");
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
